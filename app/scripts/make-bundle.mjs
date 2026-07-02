@@ -10,5 +10,10 @@ const repoRoot = path.resolve(appDir, '..');
 const out = path.join(appDir, 'public', 'bundle.tar.gz');
 
 mkdirSync(path.join(appDir, 'public'), { recursive: true });
-execSync(`tar -czf "${out}" cli interface`, { cwd: repoRoot, stdio: 'inherit' });
+// shared/ (public key) and template.config.json ship too, so ~/.{commandName}/
+// mirrors the repo layout and the CLI resolves everything the same way.
+execSync(`tar -czf "${out}" cli interface shared template.config.json`, {
+  cwd: repoRoot,
+  stdio: 'inherit',
+});
 console.log(`bundle written: ${out}`);
