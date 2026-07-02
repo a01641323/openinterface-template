@@ -1,0 +1,6 @@
+{
+  "commandName": "openinterface",
+  "brandName": "Open Interface",
+  "port": 4321,
+  "vercelUrl": "https://REPLACE_ME.vercel.app"
+}

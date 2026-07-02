@@ -1,0 +1,7 @@
+node_modules/
+.next/
+.env
+.env.local
+.env*.local
+app/public/bundle.tar.gz
+.DS_Store
