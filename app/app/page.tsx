@@ -53,7 +53,7 @@ export default function Home() {
     load();
   }
 
-  const installCmd = `curl -fsSL ${config.vercelUrl}/install.sh | bash`;
+  const installCmd = `curl -fsSL ${config.vercelUrl.replace(/\/+$/, '')}/install.sh | bash`;
 
   return (
     <main style={{ maxWidth: 640, margin: '2rem auto', padding: '0 1rem', fontFamily: 'system-ui, sans-serif' }}>
