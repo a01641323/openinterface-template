@@ -1,5 +1,46 @@
 <!doctype html>
 <html lang="en">
-  <head><meta charset="utf-8" /><title>Interface placeholder</title></head>
-  <body><p>Static interface files land here in stage 2.</p></body>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Interface</title>
+  </head>
+  <body>
+    <main>
+      <section id="locked" hidden>
+        <h1 id="brand-locked"></h1>
+        <form id="code-form">
+          <label>
+            Access code:
+            <input id="code-input" autocomplete="off" spellcheck="false" required />
+          </label>
+          <button type="submit" id="code-submit">Enter</button>
+        </form>
+        <p id="code-error" hidden></p>
+        <hr />
+        <details>
+          <summary>Join via LAN</summary>
+          <form id="lan-form">
+            <label>
+              Server IP:
+              <input id="lan-input" placeholder="192.168.1.42" required />
+            </label>
+            <button type="submit">Join</button>
+          </form>
+        </details>
+      </section>
+
+      <section id="granted" hidden>
+        <h1 id="welcome"></h1>
+        <p>LAN address: <code id="lan-address"></code></p>
+        <p>Session expires in <span id="remaining"></span></p>
+        <p>
+          <button class="color-btn">Button one</button>
+          <button class="color-btn">Button two</button>
+          <button class="color-btn">Button three</button>
+        </p>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
 </html>
