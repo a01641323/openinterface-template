@@ -1,33 +1,67 @@
 # openinterface-template
 
-A template: a Vercel-hosted app ([app/](app/)) issues time-limited access codes
-for a locally-run HTTP interface. Stage 1 = this web app. Stage 2 = the CLI
-([cli/](cli/)) and static interface ([interface/](interface/)).
+A template for time-boxed, offline-capable access to a locally-run HTTP
+interface. A Vercel app issues short-lived access codes; a curl-installed CLI
+validates a code **once** online, then everything — session enforcement, LAN
+guest approval, realtime sync — works with zero internet until the code's
+timeout expires.
 
-## Re-branding
+## Architecture
 
-Edit **template.config.json** only:
-
-```json
-{ "commandName": "...", "brandName": "...", "port": 4321, "vercelUrl": "https://<your-app>.vercel.app" }
+```
+                    INTERNET (only for: install, validate-once, update, revocation poll)
+┌──────────────────────────────────────────────┐
+│  Vercel app (/app, Next.js)                  │        ┌─────────────┐
+│                                              │◀──────▶│ Upstash     │
+│  /            landing: request code,         │  REST  │ Redis       │
+│               my-requests + live countdown   │        │ requests/   │
+│  /admin       approve(timeout)/deny/revoke   │        │ codes       │
+│  /api/validate  code → Ed25519-SIGNED GRANT  │        └─────────────┘
+│  /install.sh  installer   /api/bundle  tarball                       
+│  /api/version                                │   signs with SIGNING_PRIVATE_KEY
+└──────────────┬───────────────────────────────┘   (public key ships in bundle)
+               │ curl -fsSL {vercelUrl}/install.sh | bash
+               ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  HOST MACHINE   ~/.{commandName}/ = bundle + sealed session state │
+│                                                                   │
+│  {commandName} CLI (zero-dep Node)                                │
+│   ├─ http://0.0.0.0:{port}  serves /interface                     │
+│   ├─ grant verify OFFLINE: Ed25519 sig + expiry + clock guard     │
+│   │    (high-water mark, monotonic budget, HMAC-sealed state)     │
+│   ├─ SSE lifecycle + WebSocket /ws realtime (stdlib RFC6455)      │
+│   └─ session slaved to host grant; ends → everyone drops          │
+│                                                                   │
+│   localhost = HOST ────────┐        LAN = GUESTS                  │
+│   "Welcome [name]",        │   http://{hostLanIP}:{port}          │
+│   approve/deny prompts,    │   waiting-for-approval → buttons-    │
+│   3 synced color buttons   │   only view (or "no active session") │
+└────────────────────────────┴──────────────────────────────────────┘
 ```
 
-Everything (page titles, install command, installer script) reads from it.
-After deploying, set `vercelUrl` to your real deployment URL and redeploy.
+Re-branding for a new project touches **only [template.config.json](template.config.json)**:
 
-## Environment variables
+```json
+{ "commandName": "...", "brandName": "...", "port": 4321, "vercelUrl": "https://<app>.vercel.app" }
+```
 
-| Var | Where to get it |
+Prove it: `node scripts/verify-template.mjs` (static scan for hardcoded
+literals + boots a renamed copy and checks every surface).
+
+## Setup
+
+### 1. Keys and env vars
+
+| Var | Where it comes from |
 |---|---|
-| `UPSTASH_REDIS_REST_URL` | Upstash console → your Redis database → REST API |
-| `UPSTASH_REDIS_REST_TOKEN` | same place |
-| `SIGNING_PRIVATE_KEY` | printed by `node scripts/generate-keys.mjs` (run once; commits the public key to `shared/`, prints the private key) |
-| `ADMIN_PASSWORD` | any password you choose for /admin |
+| `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | Upstash console → create a free Redis database → REST API section |
+| `SIGNING_PRIVATE_KEY` | `node scripts/generate-keys.mjs` — run once; commits the public key to `shared/`, prints the private key (never committed) |
+| `ADMIN_PASSWORD` | any password you choose for `/admin` |
 
-## Run locally
+### 2. Run locally
 
 ```bash
-node scripts/generate-keys.mjs        # once; copy the printed private key
+node scripts/generate-keys.mjs        # once
 cd app
 cp .env.example .env.local            # fill in all four vars
 npm install
@@ -35,99 +69,59 @@ npm run dev                           # http://localhost:3000
 npm test                              # unit tests (no Redis needed)
 ```
 
-## Deploy to Vercel
+### 3. Deploy to Vercel
 
-1. Push this repo to GitHub and import it in Vercel.
-2. Set the project **Root Directory** to `app` and check that **Framework
-   Preset** says **Next.js** (if the project was first imported with the wrong
-   root directory, the preset sticks at "Other" and middleware breaks with
-   `MIDDLEWARE_INVOCATION_FAILED` — fix it in Settings → Build and Deployment).
-   The build tars `../cli` and `../interface` into the bundle, so also enable
-   the option to include source files outside the root directory.
-3. Add the four environment variables (Project → Settings → Environment
-   Variables). Paste raw values **without surrounding quotes**.
-4. Deploy, then put the deployment URL into `template.config.json` → `vercelUrl`
-   and push again.
+1. Push to GitHub, import in Vercel.
+2. **Root Directory = `app`**, and confirm **Framework Preset = Next.js**
+   (imported with the wrong root first, the preset sticks at "Other" and every
+   route dies with `MIDDLEWARE_INVOCATION_FAILED`).
+3. Enable *include source files outside of the Root Directory* (the build tars
+   `../cli`, `../interface`, `../shared` into the bundle).
+4. Add the four env vars — paste raw values, **no surrounding quotes**.
+5. Deploy, put the real URL into `template.config.json` → `vercelUrl`, push
+   again.
 
-## CLI (stage 2)
+## User journey
 
-End users install with the command shown on the landing page:
+1. **Request** — visitor opens the landing page, submits a name. An anonymous
+   cookie tracks their requests; they see status + a live countdown once
+   approved.
+2. **Approve** — you open `/admin`, log in, approve with a timeout in minutes
+   (or deny). Active codes show live countdowns; revoke/delete anytime.
+3. **Install** — visitor runs the command shown on the landing page:
+   `curl -fsSL {vercelUrl}/install.sh | bash` → bundle lands in
+   `~/.{commandName}/`, launcher in `~/.local/bin/{commandName}`, per-install
+   HMAC key created. Requires Node ≥18.
+4. **Enter code** — `{commandName}` starts the local server and opens the
+   browser; entering the code hits `/api/validate` — **the only internet call**
+   — and stores the Ed25519-signed grant, verified locally before trust.
+5. **Offline use** — refresh, close, reboot, disconnect wifi: the session
+   restores from the sealed local state until the timeout. Enforcement is
+   local: signature + wall clock + clock-tamper guards
+   ([SECURITY-NOTES.md](SECURITY-NOTES.md)).
+6. **LAN guests** — guests open `http://{hostLanIP}:{port}`, wait for the
+   host's Allow/Deny. Approved guests get a buttons-only view; button colors
+   sync in realtime over WebSocket for everyone. No internet involved.
+7. **Expiry** — at the timeout (or budget exhaustion, or detected clock
+   tampering, or revocation when online) the CLI deletes the grant and pushes
+   `sessionEnded`: host and every guest drop to the code screen instantly,
+   fully offline.
 
-```bash
-curl -fsSL https://<your-app>.vercel.app/install.sh | bash
-```
+## Update flow
 
-This downloads the bundle (`cli/`, `interface/`, `shared/`,
-`template.config.json`) into `~/.{commandName}/` and installs a launcher at
-`~/.local/bin/{commandName}` (with a PATH hint if needed). Requires Node ≥18.
+`{commandName} update` → GET `/api/version` (baked from `cli/package.json` at
+deploy time) → if newer, downloads `/api/bundle` and atomically swaps
+`cli/ interface/ shared/ template.config.json` in the install dir. The
+install key and session state survive updates. Requires internet; fails with a
+clear message offline; refuses to run inside a git checkout.
 
-- `{commandName}` — serves the interface at `http://localhost:{port}`
-  (bound to 0.0.0.0 for LAN access) and opens the browser. `--no-open` skips
-  the browser; `NO_OPEN=1` works too.
-- `{commandName} update` — checks `/api/version`, downloads `/api/bundle` and
-  atomically replaces the install if newer. Requires internet; fails with a
-  clear message offline. Refuses to run inside a git checkout.
+## Verification
 
-### Offline access model
-
-Validating a code is the only internet call the CLI ever makes. On success the
-Vercel API returns an Ed25519-signed grant token which the CLI stores at
-`~/.{commandName}/grant.json` **after verifying the signature itself** against
-`shared/signing-public-key.b64` (shipped in the bundle). From then on:
-
-- every interface load re-verifies the token locally (signature + expiry) —
-  valid sessions survive refreshes, restarts, and having no internet at all;
-- a timer in the CLI fires exactly at `expiresAt`: the grant is deleted and the
-  interface is pushed back to the code screen via SSE (with client-side timer
-  and polling as fallbacks);
-- tampered or expired grant files are deleted on sight;
-- while a session is active and the machine happens to be online, the CLI
-  re-checks the code upstream every 45s — a revocation ends the session within
-  that window. Offline machines keep their session until `expiresAt` by design.
-
-## LAN guests (stage 3)
-
-Guests on the same network open `http://{hostLanIP}:{port}` (shown on the
-host's granted view, or via "Join via LAN" on the code screen). Everything in
-this flow is LAN-only — zero internet:
-
-- The **host** is whoever reaches the CLI over loopback (`localhost`). Everyone
-  else is a guest. (Corollary: the host opening their own LAN IP is treated as
-  a guest.)
-- A joining guest sees only "waiting for approval…" while the host's view shows
-  "Device {ip} wants to join — Allow / Deny". Deny → code screen with
-  "access denied". Allow → a buttons-only view: the three buttons and nothing
-  else.
-- Button colors are synced in realtime over a WebSocket (`/ws`, served by the
-  CLI itself — a minimal stdlib RFC 6455 implementation, no npm deps). Color
-  state lives in CLI memory and is pushed on every change and on join.
-- **The session is slaved to the host's grant.** No active grant → guests get
-  a bare "no active session" page and WS connections are refused. The instant
-  the grant expires (offline timer) or is revoked-while-online (poll), every
-  client gets `sessionEnded`: guests are force-dropped to the code screen and
-  the host falls back too. If the CLI dies or a guest loses the socket, the
-  guest client detects it (close event + 45s heartbeat watchdog) and falls
-  back to the code screen on its own.
-- Approvals are per-connection and in-memory — reconnecting guests are
-  re-approved, and nothing about guests is ever persisted.
-
-## API summary
-
-- `POST /api/requests` `{name}` — create access request (anonymous cookie identifies the requester)
-- `GET /api/requests` — own requests + codes
-- `DELETE /api/requests/:id` — delete own request
-- `POST /api/admin/login` `{password}` — admin session cookie
-- `GET /api/admin/state` · `POST /api/admin/approve` `{requestId, timeoutMinutes}` · `POST /api/admin/deny` · `POST /api/admin/revoke` `{code}` · `DELETE /api/admin/requests/:id` · `DELETE /api/admin/codes/:code`
-- `POST /api/validate` `{code}` → `{token, name, expiresAt}` — token is
-  `base64url(JSON{name, code, issuedAt, expiresAt}) + "." + base64url(Ed25519 sig)`,
-  verifiable offline with `shared/signing-public-key.b64`
-- `GET /install.sh` · `GET /api/version` · `GET /api/bundle`
-
-## Code lifecycle
-
-```
-request: pending ──deny──▶ denied
-         pending ──approve(timeoutMinutes)──▶ approved ──creates──▶ code
-code:    active ──revoke──▶ revoked
-         active ──now > expiresAt──▶ expired   (lazy: applied on read, no cron)
-```
+- `cd app && npx vitest run` — unit suites for the web app store/lifecycle/
+  tokens and the CLI (WS codec, realtime state machine, clock guard, sealed
+  store).
+- `node scripts/verify-template.mjs` — template rename proof.
+- [docs/E2E-CHECKLIST.md](docs/E2E-CHECKLIST.md) — manual end-to-end checklist
+  covering all ten original requirements.
+- [SECURITY-NOTES.md](SECURITY-NOTES.md) — threat model and the honest list of
+  what offline enforcement cannot prevent.
