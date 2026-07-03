@@ -81,8 +81,35 @@ Vercel API returns an Ed25519-signed grant token which the CLI stores at
   interface is pushed back to the code screen via SSE (with client-side timer
   and polling as fallbacks);
 - tampered or expired grant files are deleted on sight;
-- revoking a code takes effect at the next *online* validation — an offline
-  machine keeps its session until `expiresAt` by design.
+- while a session is active and the machine happens to be online, the CLI
+  re-checks the code upstream every 45s — a revocation ends the session within
+  that window. Offline machines keep their session until `expiresAt` by design.
+
+## LAN guests (stage 3)
+
+Guests on the same network open `http://{hostLanIP}:{port}` (shown on the
+host's granted view, or via "Join via LAN" on the code screen). Everything in
+this flow is LAN-only — zero internet:
+
+- The **host** is whoever reaches the CLI over loopback (`localhost`). Everyone
+  else is a guest. (Corollary: the host opening their own LAN IP is treated as
+  a guest.)
+- A joining guest sees only "waiting for approval…" while the host's view shows
+  "Device {ip} wants to join — Allow / Deny". Deny → code screen with
+  "access denied". Allow → a buttons-only view: the three buttons and nothing
+  else.
+- Button colors are synced in realtime over a WebSocket (`/ws`, served by the
+  CLI itself — a minimal stdlib RFC 6455 implementation, no npm deps). Color
+  state lives in CLI memory and is pushed on every change and on join.
+- **The session is slaved to the host's grant.** No active grant → guests get
+  a bare "no active session" page and WS connections are refused. The instant
+  the grant expires (offline timer) or is revoked-while-online (poll), every
+  client gets `sessionEnded`: guests are force-dropped to the code screen and
+  the host falls back too. If the CLI dies or a guest loses the socket, the
+  guest client detects it (close event + 45s heartbeat watchdog) and falls
+  back to the code screen on its own.
+- Approvals are per-connection and in-memory — reconnecting guests are
+  re-approved, and nothing about guests is ever persisted.
 
 ## API summary
 
