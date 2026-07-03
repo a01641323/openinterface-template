@@ -4,6 +4,8 @@ import path from 'node:path';
 import { verifyGrantToken, isGrantActive } from './grant.mjs';
 import { lanIp } from './net.mjs';
 import { readGrant, writeGrant, deleteGrant } from './store.mjs';
+import { attachWebSocket } from './ws.mjs';
+import { createRealtime } from './realtime.mjs';
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -14,6 +16,9 @@ const MIME = {
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
 };
+
+const REVOCATION_POLL_MS = 45_000;
+const HEARTBEAT_MS = 20_000;
 
 function json(res, status, obj) {
   res.writeHead(status, { 'Content-Type': 'application/json' });
@@ -30,9 +35,24 @@ async function readBody(req) {
   }
 }
 
+// The host is whoever reaches us over loopback — they control the machine
+// running the CLI. Everyone else on the LAN is a guest.
+function isLoopback(remoteAddress) {
+  return (
+    remoteAddress === '127.0.0.1' ||
+    remoteAddress === '::1' ||
+    remoteAddress === '::ffff:127.0.0.1'
+  );
+}
+
+function cleanIp(remoteAddress) {
+  return String(remoteAddress ?? '').replace(/^::ffff:/, '');
+}
+
 // ctx: { config, baseUrl, dataDir, interfaceDir, publicKeyB64 }
 export function createInterfaceServer(ctx) {
   const sseClients = new Set();
+  const realtime = createRealtime();
   let expiryTimer = null;
 
   // The offline heart: read grant.json, verify signature with the embedded
@@ -48,7 +68,7 @@ export function createInterfaceServer(ctx) {
     return payload;
   }
 
-  function broadcast(event) {
+  function broadcastSse(event) {
     for (const res of sseClients) {
       try {
         res.write(`event: ${event}\ndata: {}\n\n`);
@@ -70,18 +90,21 @@ export function createInterfaceServer(ctx) {
     clearExpiryTimer();
     const MAX = 2 ** 31 - 1;
     const delta = expiresAt - Date.now();
-    if (delta <= 0) return onExpired();
+    if (delta <= 0) return endSession();
     expiryTimer = setTimeout(() => {
       expiryTimer = null;
-      if (Date.now() >= expiresAt) onExpired();
+      if (Date.now() >= expiresAt) endSession();
       else scheduleExpiry(expiresAt);
     }, Math.min(delta, MAX));
   }
 
-  function onExpired() {
+  // Single exit for expiry AND revocation-while-online: kill the grant, tell
+  // the host (SSE + WS), force every guest out. Works with zero internet.
+  function endSession() {
     clearExpiryTimer();
     deleteGrant(ctx.dataDir);
-    broadcast('expired');
+    broadcastSse('expired');
+    realtime.endSession();
   }
 
   function sessionBody() {
@@ -91,7 +114,8 @@ export function createInterfaceServer(ctx) {
     return { state: 'granted', name: payload.name, expiresAt: payload.expiresAt, ...base };
   }
 
-  // The ONLY code path that touches the internet.
+  // The ONLY code path that touches the internet (plus the revocation poll,
+  // which reuses the same endpoint and ignores network failures).
   async function handleValidate(req, res) {
     const body = await readBody(req);
     const code = typeof body?.code === 'string' ? body.code.trim() : '';
@@ -119,6 +143,7 @@ export function createInterfaceServer(ctx) {
     }
     writeGrant(ctx.dataDir, { token: data.token });
     scheduleExpiry(payload.expiresAt);
+    realtime.startSession();
     return json(res, 200, { ok: true, name: payload.name, expiresAt: payload.expiresAt });
   }
 
@@ -143,6 +168,17 @@ export function createInterfaceServer(ctx) {
     });
   }
 
+  async function serveFile(res, relPath) {
+    const full = path.join(ctx.interfaceDir, relPath);
+    try {
+      const content = await readFile(full);
+      res.writeHead(200, { 'Content-Type': MIME[path.extname(full)] ?? 'application/octet-stream' });
+      res.end(content);
+    } catch {
+      json(res, 404, { error: 'not found' });
+    }
+  }
+
   async function serveStatic(res, urlPath) {
     let rel = path.normalize(decodeURIComponent(urlPath)).replace(/^([/\\])+/, '');
     if (!rel || rel === '.') rel = 'index.html';
@@ -150,21 +186,24 @@ export function createInterfaceServer(ctx) {
     if (!full.startsWith(ctx.interfaceDir + path.sep)) {
       return json(res, 404, { error: 'not found' });
     }
-    try {
-      const content = await readFile(full);
-      res.writeHead(200, {
-        'Content-Type': MIME[path.extname(full)] ?? 'application/octet-stream',
-      });
-      res.end(content);
-    } catch {
-      json(res, 404, { error: 'not found' });
-    }
+    return serveFile(res, rel);
   }
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://local');
+    const loopback = isLoopback(req.socket.remoteAddress);
     try {
       if (url.pathname === '/api/local/session' && req.method === 'GET') {
+        // Guests never learn session details over HTTP; their world is the
+        // WS approval flow. Remote code screens see "locked" regardless.
+        if (!loopback) {
+          return json(res, 200, {
+            state: 'locked',
+            lanIp: lanIp(),
+            port: ctx.config.port,
+            brandName: ctx.config.brandName,
+          });
+        }
         return json(res, 200, sessionBody());
       }
       if (url.pathname === '/api/local/validate' && req.method === 'POST') {
@@ -173,18 +212,65 @@ export function createInterfaceServer(ctx) {
       if (url.pathname === '/api/local/events' && req.method === 'GET') {
         return handleEvents(req, res);
       }
-      if (req.method === 'GET') return await serveStatic(res, url.pathname);
+      if (req.method === 'GET') {
+        if (!loopback) {
+          // HARD RULE: without an active host grant, guests get nothing but
+          // the no-session page — no scripts, no buttons markup.
+          if (!currentGrant()) return serveFile(res, 'no-session.html');
+          if (url.pathname === '/') return serveFile(res, 'guest.html');
+        }
+        return await serveStatic(res, url.pathname);
+      }
       json(res, 405, { error: 'method not allowed' });
     } catch {
       json(res, 500, { error: 'internal error' });
     }
   });
 
+  attachWebSocket(server, '/ws', {
+    shouldAccept(req) {
+      // Guests only get a socket while a session is active; the host can
+      // always connect (they just see their own code screen when locked).
+      return isLoopback(req.socket.remoteAddress) || Boolean(currentGrant());
+    },
+    onConnection(conn, req) {
+      if (isLoopback(req.socket.remoteAddress)) realtime.addHost(conn);
+      else realtime.addGuest(conn, cleanIp(req.socket.remoteAddress));
+    },
+  });
+
+  // Revoked-while-online: re-check the code upstream while a session is
+  // active. An explicit 401 ends the session immediately; network errors are
+  // ignored — offline sessions run until expiresAt by design.
+  const revocationPoll = setInterval(async () => {
+    const payload = currentGrant();
+    if (!payload) return;
+    try {
+      const res = await fetch(`${ctx.baseUrl}/api/validate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: payload.code }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (res.status === 401) endSession();
+    } catch {
+      /* offline or upstream trouble — grant stays authoritative */
+    }
+  }, REVOCATION_POLL_MS);
+
+  // App-level heartbeat so browser clients can detect a dead link even when
+  // TCP doesn't close cleanly.
+  const heartbeat = setInterval(() => realtime.pingAll(), HEARTBEAT_MS);
+
   // Restore the session across restarts: if a valid grant exists, re-arm the
   // expiry timer so the background check still fires exactly at expiresAt.
   const existing = currentGrant();
   if (existing) scheduleExpiry(existing.expiresAt);
 
-  server.on('close', clearExpiryTimer);
+  server.on('close', () => {
+    clearExpiryTimer();
+    clearInterval(revocationPoll);
+    clearInterval(heartbeat);
+  });
   return server;
 }
