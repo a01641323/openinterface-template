@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Interface</title>
+  </head>
+  <body>
+    <main>
+      <section id="loading" hidden>
+        <p>waiting for approval…</p>
+      </section>
+
+      <!-- buttons-only view: the three buttons and NOTHING else -->
+      <section id="buttons" hidden>
+        <p>
+          <button class="color-btn" data-button="0">Button one</button>
+          <button class="color-btn" data-button="1">Button two</button>
+          <button class="color-btn" data-button="2">Button three</button>
+        </p>
+      </section>
+
+      <section id="code" hidden>
+        <h1 id="code-title"></h1>
+        <form id="code-form">
+          <label>
+            Access code:
+            <input id="code-input" autocomplete="off" spellcheck="false" required />
+          </label>
+          <button type="submit" id="code-submit">Enter</button>
+        </form>
+        <p id="code-error" hidden></p>
+      </section>
+    </main>
+    <script src="/guest.js"></script>
+  </body>
+</html>

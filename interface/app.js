@@ -1,10 +1,17 @@
-/* Vanilla JS client for the local CLI server. All calls stay on this origin;
-   the CLI is the only thing that ever talks to the internet (once, to validate). */
+/* Host client for the local CLI server. All calls stay on this origin;
+   the CLI is the only thing that ever talks to the internet (once, to
+   validate — plus its background revocation poll). Realtime state (button
+   colors, guest approvals) flows over the WebSocket; SSE remains the
+   lifecycle channel for expiry. */
 
 const $ = (id) => document.getElementById(id);
 
+// Must match PALETTE in cli/lib/realtime.mjs and interface/guest.js.
+const PALETTE = ['', '#ffe0e0', '#e0ffe0', '#e0e0ff', '#fff3c4', '#e0ffff'];
+
 let session = null;
 let eventSource = null;
+let ws = null;
 let expireTimer = null;
 let pollTimer = null;
 let tickTimer = null;
@@ -30,6 +37,11 @@ function clearTimers() {
     eventSource.close();
     eventSource = null;
   }
+  if (ws) {
+    ws.onclose = null;
+    ws.close();
+    ws = null;
+  }
 }
 
 function showLocked(s) {
@@ -39,12 +51,70 @@ function showLocked(s) {
   $('brand-locked').textContent = s.brandName || 'Enter code';
 }
 
+function applyColors(colors) {
+  document.querySelectorAll('#granted .color-btn').forEach((btn, i) => {
+    btn.style.backgroundColor = PALETTE[colors[i]] ?? '';
+  });
+}
+
+function addJoinRequest(id, ip) {
+  if (document.querySelector(`[data-request="${id}"]`)) return;
+  const row = document.createElement('p');
+  row.dataset.request = id;
+  row.append(`Device ${ip} wants to join — `);
+  const allow = document.createElement('button');
+  allow.textContent = 'Allow';
+  const deny = document.createElement('button');
+  deny.textContent = 'Deny';
+  const decide = (type) => () => {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type, id }));
+    row.remove();
+  };
+  allow.addEventListener('click', decide('approve'));
+  deny.addEventListener('click', decide('deny'));
+  row.append(allow, ' ', deny);
+  $('join-requests').append(row);
+}
+
+function removeJoinRequest(id) {
+  document.querySelector(`[data-request="${id}"]`)?.remove();
+}
+
+function connectRealtime() {
+  ws = new WebSocket(`ws://${window.location.host}/ws`);
+  ws.onmessage = (event) => {
+    let msg;
+    try {
+      msg = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    if (msg.type === 'hello') {
+      applyColors(msg.colors);
+      for (const g of msg.pending ?? []) addJoinRequest(g.id, g.ip);
+    } else if (msg.type === 'colors') {
+      applyColors(msg.colors);
+    } else if (msg.type === 'joinRequest') {
+      addJoinRequest(msg.id, msg.ip);
+    } else if (msg.type === 'guestLeft') {
+      removeJoinRequest(msg.id);
+    } else if (msg.type === 'sessionEnded') {
+      refresh();
+    }
+  };
+  ws.onclose = () => {
+    // SSE still owns lifecycle; just re-sync in case we missed something.
+    setTimeout(refresh, 1000);
+  };
+}
+
 function showGranted(s) {
   clearTimers();
   $('locked').hidden = true;
   $('granted').hidden = false;
   $('welcome').textContent = `Welcome ${s.name}`;
   $('lan-address').textContent = `http://${s.lanIp}:${s.port}`;
+  $('join-requests').replaceChildren();
 
   const tick = () => {
     const ms = s.expiresAt - Date.now();
@@ -52,6 +122,8 @@ function showGranted(s) {
   };
   tick();
   tickTimer = setInterval(tick, 1000);
+
+  connectRealtime();
 
   // Three ways to find out the session ended, in order of immediacy:
   // 1. SSE push from the CLI's background check at exactly expiresAt.
@@ -106,12 +178,13 @@ $('lan-form').addEventListener('submit', (e) => {
   window.location.href = `http://${ip}:${port}`;
 });
 
-for (const btn of document.querySelectorAll('.color-btn')) {
-  const colors = ['', '#ffe0e0', '#e0ffe0', '#e0e0ff', '#fff3c4', '#e0ffff'];
-  let i = 0;
+// Button clicks go to the server; the authoritative color state comes back
+// as a 'colors' broadcast (to us and every approved guest).
+for (const btn of document.querySelectorAll('#granted .color-btn')) {
   btn.addEventListener('click', () => {
-    i = (i + 1) % colors.length;
-    btn.style.backgroundColor = colors[i];
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'cycle', button: Number(btn.dataset.button) }));
+    }
   });
 }
 
