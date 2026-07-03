@@ -24,6 +24,15 @@ curl -fsSL "$BASE/api/bundle" -o "$TMP/bundle.tar.gz"
 mkdir -p "$DEST"
 tar -xzf "$TMP/bundle.tar.gz" -C "$DEST"
 
+# Per-install random key sealing the local session state (clock-tamper defense).
+# Created once; survives updates.
+KEY_FILE="$DEST/install-key"
+if [ ! -f "$KEY_FILE" ]; then
+  node -e 'process.stdout.write(require("node:crypto").randomBytes(32).toString("hex"))' > "$KEY_FILE"
+  echo >> "$KEY_FILE"
+  chmod 600 "$KEY_FILE"
+fi
+
 mkdir -p "$BIN_DIR"
 printf '#!/bin/sh\\nexec node "%s/cli/index.mjs" "$@"\\n' "$DEST" > "$BIN_DIR/$CMD"
 chmod +x "$BIN_DIR/$CMD"

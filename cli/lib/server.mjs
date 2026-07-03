@@ -1,9 +1,10 @@
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { verifyGrantToken, isGrantActive } from './grant.mjs';
+import { verifyGrantToken } from './grant.mjs';
 import { lanIp } from './net.mjs';
-import { readGrant, writeGrant, deleteGrant } from './store.mjs';
+import { loadInstallKey, readState, writeState, deleteState } from './sealed-store.mjs';
+import { evaluateSession, TICK_MS } from './clock-guard.mjs';
 import { attachWebSocket } from './ws.mjs';
 import { createRealtime } from './realtime.mjs';
 
@@ -53,19 +54,98 @@ function cleanIp(remoteAddress) {
 export function createInterfaceServer(ctx) {
   const sseClients = new Set();
   const realtime = createRealtime();
-  let expiryTimer = null;
+  const installKey = loadInstallKey(ctx.dataDir);
 
-  // The offline heart: read grant.json, verify signature with the embedded
-  // public key, check the clock. Anything invalid is deleted on sight.
-  function currentGrant() {
-    const stored = readGrant(ctx.dataDir);
-    if (!stored) return null;
-    const payload = verifyGrantToken(stored.token, ctx.publicKeyB64);
-    if (!payload || !isGrantActive(payload)) {
-      deleteGrant(ctx.dataDir);
+  // In-memory session is authoritative while the process runs; disk is
+  // persistence (sealed with the install key — see sealed-store.mjs).
+  // session: { tokenPayload, state: {token, highWater, budgetUsedMs}, lastHr }
+  let session = null;
+  let wallTimer = null;
+  let budgetTimer = null;
+  let tickTimer = null;
+
+  function clearSessionTimers() {
+    for (const t of [wallTimer, budgetTimer]) if (t) clearTimeout(t);
+    if (tickTimer) clearInterval(tickTimer);
+    wallTimer = budgetTimer = tickTimer = null;
+  }
+
+  // Single exit for expiry, budget exhaustion, clock tampering, integrity
+  // failure AND revocation-while-online: kill the state, tell the host
+  // (SSE + WS), force every guest out. Works with zero internet.
+  function endSession() {
+    clearSessionTimers();
+    session = null;
+    deleteState(ctx.dataDir);
+    broadcastSse('expired');
+    realtime.endSession();
+  }
+
+  // Accumulate monotonic runtime + advance the high-water mark, persist, and
+  // enforce. Runs every TICK_MS while a session is live, and once whenever a
+  // timer fires (so checks never depend on the wall clock alone).
+  function tick() {
+    if (!session) return;
+    const nowHr = process.hrtime.bigint();
+    session.state.budgetUsedMs += Number((nowHr - session.lastHr) / 1_000_000n);
+    session.lastHr = nowHr;
+    session.state.highWater = Math.max(session.state.highWater, Date.now());
+    const result = evaluateSession(session.tokenPayload, session.state);
+    if (result.status !== 'active') return endSession();
+    writeState(ctx.dataDir, installKey, session.state);
+    return result;
+  }
+
+  function armSessionRuntime() {
+    clearSessionTimers();
+    const result = evaluateSession(session.tokenPayload, session.state);
+    if (result.status !== 'active') return endSession();
+    // Wall-clock limit (chunked: setTimeout caps at 2^31-1 ms).
+    const MAX = 2 ** 31 - 1;
+    const scheduleWall = () => {
+      const delta = session.tokenPayload.expiresAt - Date.now();
+      if (delta <= 0) return endSession();
+      wallTimer = setTimeout(() => {
+        wallTimer = null;
+        if (!session) return;
+        if (Date.now() >= session.tokenPayload.expiresAt) endSession();
+        else scheduleWall();
+      }, Math.min(delta, MAX));
+    };
+    scheduleWall();
+    // Monotonic budget limit: Node timers run on the monotonic clock, so this
+    // fires after remainingBudgetMs of real runtime no matter what the wall
+    // clock does. tick() re-evaluates and ends the session if truly spent.
+    budgetTimer = setTimeout(() => {
+      budgetTimer = null;
+      if (!session) return;
+      if (tick()?.status === 'active') armSessionRuntime();
+    }, Math.min(result.remainingBudgetMs + 250, MAX));
+    tickTimer = setInterval(tick, TICK_MS);
+  }
+
+  function loadSessionFromDisk() {
+    const state = readState(ctx.dataDir, installKey);
+    if (!state) return false;
+    const tokenPayload = verifyGrantToken(state.token, ctx.publicKeyB64);
+    if (!tokenPayload || evaluateSession(tokenPayload, state).status !== 'active') {
+      deleteState(ctx.dataDir);
+      return false;
+    }
+    session = { tokenPayload, state, lastHr: process.hrtime.bigint() };
+    armSessionRuntime();
+    return true;
+  }
+
+  // Every read re-verifies signature + wall + high-water mark + budget.
+  function activeSession() {
+    if (!session && !loadSessionFromDisk()) return null;
+    const result = evaluateSession(session.tokenPayload, session.state);
+    if (result.status !== 'active') {
+      endSession();
       return null;
     }
-    return payload;
+    return session.tokenPayload;
   }
 
   function broadcastSse(event) {
@@ -78,37 +158,8 @@ export function createInterfaceServer(ctx) {
     }
   }
 
-  function clearExpiryTimer() {
-    if (expiryTimer) {
-      clearTimeout(expiryTimer);
-      expiryTimer = null;
-    }
-  }
-
-  // setTimeout caps at 2^31-1 ms (~24.8 days); chunk longer waits.
-  function scheduleExpiry(expiresAt) {
-    clearExpiryTimer();
-    const MAX = 2 ** 31 - 1;
-    const delta = expiresAt - Date.now();
-    if (delta <= 0) return endSession();
-    expiryTimer = setTimeout(() => {
-      expiryTimer = null;
-      if (Date.now() >= expiresAt) endSession();
-      else scheduleExpiry(expiresAt);
-    }, Math.min(delta, MAX));
-  }
-
-  // Single exit for expiry AND revocation-while-online: kill the grant, tell
-  // the host (SSE + WS), force every guest out. Works with zero internet.
-  function endSession() {
-    clearExpiryTimer();
-    deleteGrant(ctx.dataDir);
-    broadcastSse('expired');
-    realtime.endSession();
-  }
-
   function sessionBody() {
-    const payload = currentGrant();
+    const payload = activeSession();
     const base = { lanIp: lanIp(), port: ctx.config.port, brandName: ctx.config.brandName };
     if (!payload) return { state: 'locked', ...base };
     return { state: 'granted', name: payload.name, expiresAt: payload.expiresAt, ...base };
@@ -138,11 +189,13 @@ export function createInterfaceServer(ctx) {
     const data = await upstream.json().catch(() => null);
     // Never store a token we haven't verified ourselves.
     const payload = data ? verifyGrantToken(data.token, ctx.publicKeyB64) : null;
-    if (!payload || !isGrantActive(payload)) {
+    if (!payload || Date.now() >= payload.expiresAt) {
       return json(res, 502, { ok: false, reason: 'bad_token' });
     }
-    writeGrant(ctx.dataDir, { token: data.token });
-    scheduleExpiry(payload.expiresAt);
+    const state = { token: data.token, highWater: Date.now(), budgetUsedMs: 0 };
+    writeState(ctx.dataDir, installKey, state);
+    session = { tokenPayload: payload, state, lastHr: process.hrtime.bigint() };
+    armSessionRuntime();
     realtime.startSession();
     return json(res, 200, { ok: true, name: payload.name, expiresAt: payload.expiresAt });
   }
@@ -216,7 +269,7 @@ export function createInterfaceServer(ctx) {
         if (!loopback) {
           // HARD RULE: without an active host grant, guests get nothing but
           // the no-session page — no scripts, no buttons markup.
-          if (!currentGrant()) return serveFile(res, 'no-session.html');
+          if (!activeSession()) return serveFile(res, 'no-session.html');
           if (url.pathname === '/') return serveFile(res, 'guest.html');
         }
         return await serveStatic(res, url.pathname);
@@ -231,7 +284,7 @@ export function createInterfaceServer(ctx) {
     shouldAccept(req) {
       // Guests only get a socket while a session is active; the host can
       // always connect (they just see their own code screen when locked).
-      return isLoopback(req.socket.remoteAddress) || Boolean(currentGrant());
+      return isLoopback(req.socket.remoteAddress) || Boolean(activeSession());
     },
     onConnection(conn, req) {
       if (isLoopback(req.socket.remoteAddress)) realtime.addHost(conn);
@@ -241,9 +294,10 @@ export function createInterfaceServer(ctx) {
 
   // Revoked-while-online: re-check the code upstream while a session is
   // active. An explicit 401 ends the session immediately; network errors are
-  // ignored — offline sessions run until expiresAt by design.
+  // ignored — offline sessions run until their limits by design. This check
+  // is opportunistic, never required.
   const revocationPoll = setInterval(async () => {
-    const payload = currentGrant();
+    const payload = activeSession();
     if (!payload) return;
     try {
       const res = await fetch(`${ctx.baseUrl}/api/validate`, {
@@ -254,7 +308,7 @@ export function createInterfaceServer(ctx) {
       });
       if (res.status === 401) endSession();
     } catch {
-      /* offline or upstream trouble — grant stays authoritative */
+      /* offline or upstream trouble — local state stays authoritative */
     }
   }, REVOCATION_POLL_MS);
 
@@ -262,13 +316,11 @@ export function createInterfaceServer(ctx) {
   // TCP doesn't close cleanly.
   const heartbeat = setInterval(() => realtime.pingAll(), HEARTBEAT_MS);
 
-  // Restore the session across restarts: if a valid grant exists, re-arm the
-  // expiry timer so the background check still fires exactly at expiresAt.
-  const existing = currentGrant();
-  if (existing) scheduleExpiry(existing.expiresAt);
+  // Restore the session across restarts (offline refresh/reopen contract).
+  loadSessionFromDisk();
 
   server.on('close', () => {
-    clearExpiryTimer();
+    clearSessionTimers();
     clearInterval(revocationPoll);
     clearInterval(heartbeat);
   });
