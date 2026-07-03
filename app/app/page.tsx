@@ -23,6 +23,7 @@ export default function Home() {
   const [name, setName] = useState('');
   const [requests, setRequests] = useState<MyRequest[]>([]);
   const [copied, setCopied] = useState(false);
+  const [copiedWin, setCopiedWin] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
   const load = useCallback(async () => {
@@ -54,6 +55,7 @@ export default function Home() {
   }
 
   const installCmd = `curl -fsSL ${config.vercelUrl.replace(/\/+$/, '')}/install.sh | bash`;
+  const winInstallCmd = `irm ${config.vercelUrl.replace(/\/+$/, '')}/install.ps1 | iex`;
 
   return (
     <main style={{ maxWidth: 640, margin: '2rem auto', padding: '0 1rem', fontFamily: 'system-ui, sans-serif' }}>
@@ -76,6 +78,7 @@ export default function Home() {
       <section>
         <h2>Install</h2>
         <p>
+          macOS / Linux:{' '}
           <code>{installCmd}</code>{' '}
           <button
             onClick={async () => {
@@ -85,6 +88,19 @@ export default function Home() {
             }}
           >
             {copied ? 'Copied' : 'Copy'}
+          </button>
+        </p>
+        <p>
+          Windows (PowerShell):{' '}
+          <code>{winInstallCmd}</code>{' '}
+          <button
+            onClick={async () => {
+              await navigator.clipboard.writeText(winInstallCmd);
+              setCopiedWin(true);
+              setTimeout(() => setCopiedWin(false), 2000);
+            }}
+          >
+            {copiedWin ? 'Copied' : 'Copy'}
           </button>
         </p>
       </section>
