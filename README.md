@@ -38,15 +38,51 @@ npm test                              # unit tests (no Redis needed)
 ## Deploy to Vercel
 
 1. Push this repo to GitHub and import it in Vercel.
-2. Set the project **Root Directory** to `app`. The build tars `../cli` and
-   `../interface` into the bundle, so the deployment must include files outside
-   the root directory — in Vercel's Root Directory settings enable the option
-   to include source files outside the root directory (if your Vercel plan/UI
-   doesn't show that option, I don't know an alternative other than making the
-   repo root the project root and adding a root-level build config).
-3. Add the four environment variables (Project → Settings → Environment Variables).
+2. Set the project **Root Directory** to `app` and check that **Framework
+   Preset** says **Next.js** (if the project was first imported with the wrong
+   root directory, the preset sticks at "Other" and middleware breaks with
+   `MIDDLEWARE_INVOCATION_FAILED` — fix it in Settings → Build and Deployment).
+   The build tars `../cli` and `../interface` into the bundle, so also enable
+   the option to include source files outside the root directory.
+3. Add the four environment variables (Project → Settings → Environment
+   Variables). Paste raw values **without surrounding quotes**.
 4. Deploy, then put the deployment URL into `template.config.json` → `vercelUrl`
    and push again.
+
+## CLI (stage 2)
+
+End users install with the command shown on the landing page:
+
+```bash
+curl -fsSL https://<your-app>.vercel.app/install.sh | bash
+```
+
+This downloads the bundle (`cli/`, `interface/`, `shared/`,
+`template.config.json`) into `~/.{commandName}/` and installs a launcher at
+`~/.local/bin/{commandName}` (with a PATH hint if needed). Requires Node ≥18.
+
+- `{commandName}` — serves the interface at `http://localhost:{port}`
+  (bound to 0.0.0.0 for LAN access) and opens the browser. `--no-open` skips
+  the browser; `NO_OPEN=1` works too.
+- `{commandName} update` — checks `/api/version`, downloads `/api/bundle` and
+  atomically replaces the install if newer. Requires internet; fails with a
+  clear message offline. Refuses to run inside a git checkout.
+
+### Offline access model
+
+Validating a code is the only internet call the CLI ever makes. On success the
+Vercel API returns an Ed25519-signed grant token which the CLI stores at
+`~/.{commandName}/grant.json` **after verifying the signature itself** against
+`shared/signing-public-key.b64` (shipped in the bundle). From then on:
+
+- every interface load re-verifies the token locally (signature + expiry) —
+  valid sessions survive refreshes, restarts, and having no internet at all;
+- a timer in the CLI fires exactly at `expiresAt`: the grant is deleted and the
+  interface is pushed back to the code screen via SSE (with client-side timer
+  and polling as fallbacks);
+- tampered or expired grant files are deleted on sight;
+- revoking a code takes effect at the next *online* validation — an offline
+  machine keeps its session until `expiresAt` by design.
 
 ## API summary
 

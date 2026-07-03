@@ -7,6 +7,12 @@
       "runtimeArgs": ["run", "dev"],
       "cwd": "app",
       "port": 3000
+    },
+    {
+      "name": "cli",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["cli/index.mjs", "--no-open"],
+      "port": 4321
     }
   ]
 }
