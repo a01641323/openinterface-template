@@ -2,6 +2,5 @@
   "name": "cli",
   "private": true,
   "version": "0.2.0",
-  "type": "module",
-  "bin": { "openinterface": "index.mjs" }
+  "type": "module"
 }
